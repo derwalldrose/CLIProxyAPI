@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -81,9 +82,41 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if opts.Alt == "conversation" {
+		return e.executeConversation(ctx, auth, req, opts)
+	}
+	if opts.Alt == "chat2api" {
+		return e.executeChat2API(ctx, auth, req, opts)
+	}
+	if opts.Alt == "responses" {
+		return e.executeResponses(ctx, auth, req, opts)
+	}
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
 	}
+	if shouldPreferChat2APIForCodex(auth) {
+		return e.executeChat2API(ctx, auth, req, opts)
+	}
+	if shouldPreferConversationForCodex(auth) {
+		resp, err = e.executeConversation(ctx, auth, req, opts)
+		if err != nil {
+			logCodexConversationRouteFailure(ctx, err)
+		}
+		if err == nil || !shouldFallbackFromConversationForCodex(auth, err) {
+			return resp, err
+		}
+		logWithRequestID(ctx).Debug("codex auto route: conversation failed, falling back to responses")
+		return e.executeResponses(ctx, auth, req, opts)
+	}
+	resp, err = e.executeResponses(ctx, auth, req, opts)
+	if err == nil || !shouldFallbackToConversationForCodex(auth, err) {
+		return resp, err
+	}
+	logWithRequestID(ctx).Debug("codex auto route: responses failed, falling back to conversation")
+	return e.executeConversation(ctx, auth, req, opts)
+}
+
+func (e *CodexExecutor) executeResponses(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -164,7 +197,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		translateBody = nil
 	}
 	out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FromString("codex"), from, req.Model, translateOriginalPayload, translateBody, data, &param)
-	resp = cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{
+		Payload:  []byte(out),
+		Headers:  httpResp.Header.Clone(),
+		Metadata: map[string]any{"codex_route": "responses"},
+	}
 	return resp, nil
 }
 
@@ -253,9 +290,41 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 }
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if opts.Alt == "conversation" {
+		return e.executeConversationStream(ctx, auth, req, opts)
+	}
+	if opts.Alt == "chat2api" {
+		return e.executeChat2APIStream(ctx, auth, req, opts)
+	}
+	if opts.Alt == "responses" {
+		return e.executeResponsesStream(ctx, auth, req, opts)
+	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
+	if shouldPreferChat2APIForCodex(auth) {
+		return e.executeChat2APIStream(ctx, auth, req, opts)
+	}
+	if shouldPreferConversationForCodex(auth) {
+		result, errExec := e.executeConversationStream(ctx, auth, req, opts)
+		if errExec != nil {
+			logCodexConversationRouteFailure(ctx, errExec)
+		}
+		if errExec == nil || !shouldFallbackFromConversationForCodex(auth, errExec) {
+			return result, errExec
+		}
+		logWithRequestID(ctx).Debug("codex auto route(stream): conversation failed, falling back to responses")
+		return e.executeResponsesStream(ctx, auth, req, opts)
+	}
+	result, errExec := e.executeResponsesStream(ctx, auth, req, opts)
+	if errExec == nil || !shouldFallbackToConversationForCodex(auth, errExec) {
+		return result, errExec
+	}
+	logWithRequestID(ctx).Debug("codex auto route(stream): responses failed, falling back to conversation")
+	return e.executeConversationStream(ctx, auth, req, opts)
+}
+
+func (e *CodexExecutor) executeResponsesStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -364,6 +433,104 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func shouldPreferConversationForCodex(auth *cliproxyauth.Auth) bool {
+	return canUseConversationForCodex(auth) && !codexHasRefreshToken(auth)
+}
+
+func shouldFallbackToConversationForCodex(auth *cliproxyauth.Auth, err error) bool {
+	return canUseConversationForCodex(auth) && shouldFallbackBetweenCodexRoutes(err)
+}
+
+func shouldFallbackFromConversationForCodex(auth *cliproxyauth.Auth, err error) bool {
+	return codexHasRefreshToken(auth) && canUseResponsesForCodex(auth) && shouldFallbackBetweenCodexRoutes(err)
+}
+
+func canUseConversationForCodex(auth *cliproxyauth.Auth) bool {
+	return resolveConversationAccessToken(auth) != "" && resolveConversationAccountID(auth) != ""
+}
+
+func canUseResponsesForCodex(auth *cliproxyauth.Auth) bool {
+	return codexAccessToken(auth) != ""
+}
+
+func codexHasRefreshToken(auth *cliproxyauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["refresh_token"]); v != "" {
+			return true
+		}
+	}
+	if auth.Metadata != nil {
+		if v := metaStringValue(auth.Metadata, "refresh_token"); v != "" {
+			return true
+		}
+		if tokenMap, ok := auth.Metadata["token"].(map[string]any); ok {
+			if v := metaStringValue(tokenMap, "refresh_token"); v != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func shouldFallbackBetweenCodexRoutes(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(lower, "enable javascript and cookies to continue"),
+		strings.Contains(lower, "__cf_chl"),
+		strings.Contains(lower, "cf_chl_"),
+		strings.Contains(lower, "managed challenge"),
+		strings.Contains(lower, "chatgpt.com"),
+		strings.Contains(lower, "auth_unavailable"),
+		strings.Contains(lower, "payment_required"),
+		strings.Contains(lower, "insufficient_quota"),
+		strings.Contains(lower, "usage_limit_reached"):
+		return true
+	}
+
+	type statusCoder interface{ StatusCode() int }
+	var se statusCoder
+	if errors.As(err, &se) {
+		switch se.StatusCode() {
+		case http.StatusUnauthorized,
+			http.StatusForbidden,
+			http.StatusNotFound,
+			http.StatusRequestTimeout,
+			http.StatusConflict,
+			http.StatusTooManyRequests,
+			http.StatusBadGateway,
+			http.StatusServiceUnavailable,
+			http.StatusGatewayTimeout:
+			return true
+		}
+		if se.StatusCode() >= 500 {
+			return true
+		}
+	}
+	return false
+}
+
+func logCodexConversationRouteFailure(ctx context.Context, err error) {
+	if err == nil {
+		return
+	}
+	body := strings.TrimSpace(err.Error())
+	if se, ok := err.(interface{ StatusCode() int }); ok {
+		if body == "" {
+			logWithRequestID(ctx).Debugf("codex conversation route failed: status=%d", se.StatusCode())
+			return
+		}
+		logWithRequestID(ctx).Debugf("codex conversation route failed: status=%d body=%s", se.StatusCode(), body)
+		return
+	}
+	logWithRequestID(ctx).Debugf("codex conversation route failed: err=%v", err)
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -673,10 +840,8 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		r.Header.Set("Originator", codexOriginator)
 	}
 	if !isAPIKey {
-		if auth != nil && auth.Metadata != nil {
-			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
-			}
+		if accountID := codexAccountID(auth); accountID != "" {
+			r.Header.Set("Chatgpt-Account-Id", accountID)
 		}
 	}
 	var attrs map[string]string
@@ -755,16 +920,87 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 	if a == nil {
 		return "", ""
 	}
-	if a.Attributes != nil {
-		apiKey = a.Attributes["api_key"]
-		baseURL = a.Attributes["base_url"]
+	return codexAccessToken(a), codexBaseURL(a)
+}
+
+func codexAccessToken(a *cliproxyauth.Auth) string {
+	if a == nil {
+		return ""
 	}
-	if apiKey == "" && a.Metadata != nil {
-		if v, ok := a.Metadata["access_token"].(string); ok {
-			apiKey = v
+	if a.Attributes != nil {
+		if v := strings.TrimSpace(a.Attributes["api_key"]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(a.Attributes["access_token"]); v != "" {
+			return v
 		}
 	}
-	return
+	if a.Metadata != nil {
+		if v := metaStringValue(a.Metadata, "access_token"); v != "" {
+			return v
+		}
+		if tokenMap, ok := a.Metadata["token"].(map[string]any); ok {
+			if v := metaStringValue(tokenMap, "access_token"); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func codexBaseURL(a *cliproxyauth.Auth) string {
+	if a == nil {
+		return ""
+	}
+	if a.Attributes != nil {
+		if v := strings.TrimSpace(a.Attributes["base_url"]); v != "" {
+			return v
+		}
+	}
+	if a.Metadata != nil {
+		if v := metaStringValue(a.Metadata, "base_url"); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func codexAccountID(a *cliproxyauth.Auth) string {
+	if a == nil {
+		return ""
+	}
+
+	for _, key := range []string{"account_id", "workspace_id", "chatgpt_account_id"} {
+		if a.Attributes != nil {
+			if v := strings.TrimSpace(a.Attributes[key]); v != "" {
+				return v
+			}
+		}
+	}
+
+	if a.Metadata != nil {
+		for _, key := range []string{"account_id", "workspace_id", "chatgpt_account_id"} {
+			if v := metaStringValue(a.Metadata, key); v != "" {
+				return v
+			}
+		}
+		if tokenMap, ok := a.Metadata["token"].(map[string]any); ok {
+			for _, key := range []string{"account_id", "workspace_id", "chatgpt_account_id"} {
+				if v := metaStringValue(tokenMap, key); v != "" {
+					return v
+				}
+			}
+		}
+		if idToken := metaStringValue(a.Metadata, "id_token"); idToken != "" {
+			if claims, err := codexauth.ParseJWTToken(idToken); err == nil && claims != nil {
+				if v := strings.TrimSpace(claims.GetAccountID()); v != "" {
+					return v
+				}
+			}
+		}
+	}
+
+	return ""
 }
 
 func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.CodexKey {

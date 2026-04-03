@@ -1,4 +1,27 @@
 services:
+  chat2api:
+    image: ${CHAT2API_IMAGE:-chat2api-local:latest}
+    build:
+      context: ${CHAT2API_CONTEXT:-../gpt-regist-codex/chat2api}
+      dockerfile: Dockerfile
+    container_name: chat2api
+    restart: unless-stopped
+    environment:
+      TZ: ${CHAT2API_TZ:-UTC}
+      CHATGPT_BASE_URL: ${CHATGPT_BASE_URL:-https://chatgpt.com}
+      PROXY_URL: ${CHAT2API_PROXY_URL:-}
+      IMPERSONATE: ${CHAT2API_IMPERSONATE:-["chrome"]}
+      OAI_LANGUAGE: ${CHAT2API_OAI_LANGUAGE:-en-US}
+      ENABLE_GATEWAY: ${CHAT2API_ENABLE_GATEWAY:-false}
+      AUTO_SEED: ${CHAT2API_AUTO_SEED:-true}
+      HISTORY_DISABLED: ${CHAT2API_HISTORY_DISABLED:-true}
+    ports:
+      - "${CHAT2API_PORT:-5005}:5005"
+    volumes:
+      - ${CHAT2API_DATA_PATH:-./chat2api-data}:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
   cli-proxy-api:
     image: ${CLI_PROXY_IMAGE:-ghcr.io/arron196/cliproxyapi:latest}
     pull_policy: always
@@ -10,6 +33,8 @@ services:
         COMMIT: ${COMMIT:-none}
         BUILD_DATE: ${BUILD_DATE:-unknown}
     container_name: cli-proxy-api
+    depends_on:
+      - chat2api
     # env_file:
     #   - .env
     environment:
@@ -25,4 +50,6 @@ services:
       - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:/CLIProxyAPI/config.yaml
       - ${CLI_PROXY_AUTH_PATH:-./auths}:/root/.cli-proxy-api
       - ${CLI_PROXY_LOG_PATH:-./logs}:/CLIProxyAPI/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped

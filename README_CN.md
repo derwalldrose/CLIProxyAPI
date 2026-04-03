@@ -58,6 +58,50 @@ ghcr.io/arron196/cliproxyapi:latest
 
 开启相关配置后，管理端点会暴露在 `/v0/management`。本分支当前不提供独立的外部文档站点。
 
+## ChatGPT Web access_token 模式
+
+当前分支额外支持把 `ChatGPT Web access_token` 作为 Codex 上游凭证使用：
+
+- 对外入口仍然是 `POST /v1/responses`
+  - 代理会在内部按需在 `chatgpt.com/backend-api/codex/responses`
+    和 `chatgpt.com/backend-api/conversation` 之间自动切换
+  - 更适合只有 ChatGPT Web `access_token` / `account_id` 的场景
+
+如果你想直接导入 auth 文件，可使用类似下面的最小结构：
+
+```json
+{
+  "type": "codex",
+  "email": "you@example.com",
+  "access_token": "eyJ...",
+  "account_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "base_url": "https://chatgpt.com"
+}
+```
+
+兼容的账号字段别名还包括：
+
+- `workspace_id`
+- `chatgpt_account_id`
+
+如果只有 `access_token`，没有 `refresh_token`，则不会自动刷新；过期后需要重新登录并重新导入新的 token。
+
+### chat2api sidecar 回退
+
+当前分支还支持在 `refresh_token` 缺失时，自动把 ChatGPT/Codex 请求转发到本地 `chat2api` sidecar。
+
+- 配置项：`chat2api-url`
+- Compose 联动示例：见 `docker-compose.yml`
+- 推荐容器内地址：`http://chat2api:5005`
+
+快速验证可直接执行：
+
+```bash
+bash examples/test_chat_model.sh http://127.0.0.1:8317 123456 gpt-5.4 "Hello"
+```
+
+> 说明：当前仓库本体不包含管理面板前端源码，所以“按钮类”联调入口不在这里；这里只提供 API/Compose/脚本侧联调能力。
+
 ## 项目身份说明
 
 - 上游基线：`router-for-me/CLIProxyAPI`

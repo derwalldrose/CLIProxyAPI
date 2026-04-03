@@ -58,6 +58,34 @@ ghcr.io/arron196/cliproxyapi:latest
 
 Management endpoints are exposed under `/v0/management` when enabled in configuration. This fork does not currently publish a separate external documentation site.
 
+## ChatGPT Web access-token mode
+
+This fork also supports using a ChatGPT Web `access_token` as Codex upstream auth:
+
+- `POST /v1/responses` remains the public entrypoint
+  - the proxy may internally switch between `chatgpt.com/backend-api/codex/responses`
+    and `chatgpt.com/backend-api/conversation` when needed
+  - useful when you only have ChatGPT Web `access_token` + `account_id`
+
+Minimal auth-file example:
+
+```json
+{
+  "type": "codex",
+  "email": "you@example.com",
+  "access_token": "eyJ...",
+  "account_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "base_url": "https://chatgpt.com"
+}
+```
+
+Supported account-id aliases also include:
+
+- `workspace_id`
+- `chatgpt_account_id`
+
+If you only provide an `access_token` without a `refresh_token`, auto-refresh is not possible; once it expires, you need to sign in again and replace it.
+
 ## Project Identity
 
 - Upstream base: `router-for-me/CLIProxyAPI`

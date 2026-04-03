@@ -82,14 +82,25 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		return
 	}
 
-	// Check if the client requested a streaming response.
-	streamResult := gjson.GetBytes(rawJSON, "stream")
-	if streamResult.Type == gjson.True {
-		h.handleStreamingResponse(c, rawJSON)
-	} else {
-		h.handleNonStreamingResponse(c, rawJSON)
+	h.dispatchResponses(c, rawJSON, "")
+}
+
+// Conversation preserves the OpenAI Responses request/response schema while
+// forcing the downstream Codex provider to use the ChatGPT Web conversation
+// backend. This helper is intentionally not mounted as a public route.
+func (h *OpenAIResponsesAPIHandler) Conversation(c *gin.Context) {
+	rawJSON, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
 	}
 
+	h.dispatchResponses(c, rawJSON, "conversation")
 }
 
 func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
@@ -136,6 +147,16 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	cliCancel()
 }
 
+func (h *OpenAIResponsesAPIHandler) dispatchResponses(c *gin.Context, rawJSON []byte, alt string) {
+	// Check if the client requested a streaming response.
+	streamResult := gjson.GetBytes(rawJSON, "stream")
+	if streamResult.Type == gjson.True {
+		h.handleStreamingResponse(c, rawJSON, alt)
+		return
+	}
+	h.handleNonStreamingResponse(c, rawJSON, alt)
+}
+
 // handleNonStreamingResponse handles non-streaming chat completion responses
 // for Gemini models. It selects a client from the pool, sends the request, and
 // aggregates the response before sending it back to the client in OpenAIResponses format.
@@ -143,14 +164,14 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 //   - rawJSON: The raw JSON bytes of the OpenAIResponses-compatible request
-func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte) {
+func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte, alt string) {
 	c.Header("Content-Type", "application/json")
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	stopKeepAlive()
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
@@ -169,7 +190,7 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, r
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 //   - rawJSON: The raw JSON bytes of the OpenAIResponses-compatible request
-func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byte) {
+func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byte, alt string) {
 	// Get the http.Flusher interface to manually flush the response.
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
@@ -185,7 +206,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")

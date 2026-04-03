@@ -42,6 +42,14 @@ type authTabModel struct {
 	editField    int             // index into authEditableFields
 	editInput    textinput.Model // text input for editing
 	editFileName string          // name of file being edited
+
+	// Model test state
+	testing         bool
+	testStage       string // "model" or "prompt"
+	testInput       textinput.Model
+	testFileName    string
+	testModel       string
+	lastTestResults map[string]map[string]any
 }
 
 type authFilesMsg struct {
@@ -54,14 +62,24 @@ type authActionMsg struct {
 	err    error
 }
 
+type authModelTestMsg struct {
+	fileName string
+	result   map[string]any
+	err      error
+}
+
 func newAuthTabModel(client *Client) authTabModel {
 	ti := textinput.New()
 	ti.CharLimit = 256
+	testInput := textinput.New()
+	testInput.CharLimit = 1024
 	return authTabModel{
-		client:    client,
-		expanded:  -1,
-		confirm:   -1,
-		editInput: ti,
+		client:          client,
+		expanded:        -1,
+		confirm:         -1,
+		editInput:       ti,
+		testInput:       testInput,
+		lastTestResults: map[string]map[string]any{},
 	}
 }
 
@@ -103,7 +121,40 @@ func (m authTabModel) Update(msg tea.Msg) (authTabModel, tea.Cmd) {
 		m.viewport.SetContent(m.renderContent())
 		return m, m.fetchFiles
 
+	case authModelTestMsg:
+		if msg.err != nil {
+			m.status = errorStyle.Render("✗ " + msg.err.Error())
+		} else {
+			if m.lastTestResults == nil {
+				m.lastTestResults = map[string]map[string]any{}
+			}
+			m.lastTestResults[msg.fileName] = msg.result
+			ok, _ := msg.result["ok"].(bool)
+			output := strings.TrimSpace(getAnyString(msg.result, "output_text"))
+			if len(output) > 120 {
+				output = output[:117] + "..."
+			}
+			if ok {
+				action := fmt.Sprintf(T("test_model_ok"), getAnyString(msg.result, "model"), getAnyString(msg.result, "effective_route"))
+				if output != "" {
+					action += " • " + output
+				}
+				m.status = successStyle.Render("✓ " + action)
+			} else {
+				errText := strings.TrimSpace(getAnyString(msg.result, "error"))
+				if errText == "" {
+					errText = T("test_model_failed")
+				}
+				m.status = errorStyle.Render("✗ " + errText)
+			}
+		}
+		m.viewport.SetContent(m.renderContent())
+		return m, nil
+
 	case tea.KeyMsg:
+		if m.testing {
+			return m.handleTestInput(msg)
+		}
 		// ---- Editing mode ----
 		if m.editing {
 			return m.handleEditInput(msg)
@@ -143,10 +194,27 @@ func (m *authTabModel) startEdit(fieldIdx int) tea.Cmd {
 	return textinput.Blink
 }
 
+func (m *authTabModel) startModelTest() tea.Cmd {
+	if m.cursor >= len(m.files) {
+		return nil
+	}
+	f := m.files[m.cursor]
+	m.testFileName = getString(f, "name")
+	m.testModel = ""
+	m.testing = true
+	m.testStage = "model"
+	m.testInput.SetValue("")
+	m.testInput.Focus()
+	m.testInput.Prompt = "  Model: "
+	m.viewport.SetContent(m.renderContent())
+	return textinput.Blink
+}
+
 func (m *authTabModel) SetSize(w, h int) {
 	m.width = w
 	m.height = h
 	m.editInput.Width = w - 20
+	m.testInput.Width = w - 20
 	if !m.ready {
 		m.viewport = viewport.New(w, h)
 		m.viewport.SetContent(m.renderContent())
@@ -236,6 +304,13 @@ func (m authTabModel) renderContent() string {
 			sb.WriteString("\n")
 		}
 
+		if m.testing && i == m.cursor {
+			sb.WriteString(m.testInput.View())
+			sb.WriteString("\n")
+			sb.WriteString(helpStyle.Render("    " + T("enter_submit") + " • " + T("esc_cancel")))
+			sb.WriteString("\n")
+		}
+
 		// Expanded detail view
 		if m.expanded == i {
 			sb.WriteString(m.renderDetail(f))
@@ -307,6 +382,33 @@ func (m authTabModel) renderDetail(f map[string]any) string {
 		sb.WriteString("\n")
 	}
 
+	if result, ok := m.lastTestResults[getString(f, "name")]; ok && len(result) > 0 {
+		sb.WriteString("    ├─────────────────────────────────────────────\n")
+		for _, field := range []struct {
+			label string
+			key   string
+		}{
+			{"Test OK", "ok"},
+			{"Test Model", "model"},
+			{"Test Route", "effective_route"},
+			{"Test Error", "error"},
+			{"Test Output", "output_text"},
+		} {
+			val := strings.TrimSpace(getAnyString(result, field.key))
+			if val == "" || val == "<nil>" {
+				continue
+			}
+			if len(val) > 96 {
+				val = val[:93] + "..."
+			}
+			line := fmt.Sprintf("    │ %s %s",
+				labelStyle.Render(fmt.Sprintf("%-12s:", field.label)),
+				valueStyle.Render(val))
+			sb.WriteString(line)
+			sb.WriteString("\n")
+		}
+	}
+
 	sb.WriteString("    └─────────────────────────────────────────────\n")
 	return sb.String()
 }
@@ -365,6 +467,55 @@ func (m authTabModel) handleEditInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) {
 		m.viewport.SetContent(m.renderContent())
 		return m, cmd
 	}
+}
+
+func (m authTabModel) handleTestInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		value := strings.TrimSpace(m.testInput.Value())
+		switch m.testStage {
+		case "model":
+			if value == "" {
+				return m, func() tea.Msg {
+					return authModelTestMsg{err: fmt.Errorf("%s", T("test_model_missing_model"))}
+				}
+			}
+			m.testModel = value
+			m.testStage = "prompt"
+			m.testInput.SetValue("")
+			m.testInput.Prompt = "  Prompt: "
+			m.viewport.SetContent(m.renderContent())
+			return m, textinput.Blink
+		case "prompt":
+			if value == "" {
+				return m, func() tea.Msg {
+					return authModelTestMsg{err: fmt.Errorf("%s", T("test_model_missing_prompt"))}
+				}
+			}
+			fileName := m.testFileName
+			model := m.testModel
+			prompt := value
+			m.testing = false
+			m.testStage = ""
+			m.testInput.Blur()
+			m.viewport.SetContent(m.renderContent())
+			return m, func() tea.Msg {
+				result, err := m.client.TestAuthFileModel(fileName, model, prompt, "auto")
+				return authModelTestMsg{fileName: fileName, result: result, err: err}
+			}
+		}
+	case "esc":
+		m.testing = false
+		m.testStage = ""
+		m.testModel = ""
+		m.testInput.Blur()
+		m.viewport.SetContent(m.renderContent())
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.testInput, cmd = m.testInput.Update(msg)
+	m.viewport.SetContent(m.renderContent())
+	return m, cmd
 }
 
 func (m authTabModel) handleConfirmInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) {
@@ -445,6 +596,8 @@ func (m authTabModel) handleNormalInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) 
 		return m, m.startEdit(1) // proxy_url
 	case "3":
 		return m, m.startEdit(2) // priority
+	case "t", "T":
+		return m, m.startModelTest()
 	case "r":
 		m.status = ""
 		return m, m.fetchFiles

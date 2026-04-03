@@ -185,6 +185,28 @@ func (c *Client) PatchAuthFileFields(name string, fields map[string]any) error {
 	return err
 }
 
+// TestAuthFileModel runs a one-shot model invocation against a specific auth file.
+func (c *Client) TestAuthFileModel(name, model, prompt, route string) (map[string]any, error) {
+	body, _ := json.Marshal(map[string]any{
+		"name":   name,
+		"model":  model,
+		"prompt": prompt,
+		"route":  route,
+	})
+	data, code, err := c.doRequest("POST", "/v0/management/auth-files/test-model", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	if code >= 400 {
+		return nil, fmt.Errorf("HTTP %d: %s", code, strings.TrimSpace(string(data)))
+	}
+	var result map[string]any
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // GetLogs fetches log lines from the server.
 func (c *Client) GetLogs(after int64, limit int) ([]string, int64, error) {
 	query := url.Values{}

@@ -9,6 +9,11 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// Chat2APIURL is the local/remote chat2api service base URL used as the
+	// preferred upstream for access-token-only ChatGPT/Codex auth entries.
+	// Example: http://127.0.0.1:5005
+	Chat2APIURL string `yaml:"chat2api-url" json:"chat2api-url"`
+
 	// ForceModelPrefix requires explicit model prefixes (e.g., "teamA/gemini-3-pro-preview")
 	// to target prefixed credentials. When false, unprefixed model requests may use prefixed
 	// credentials as well.
